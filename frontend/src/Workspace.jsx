@@ -137,19 +137,27 @@ export default function Workspace({ user, onLogout }) {
     const L = (nx, ny, zo = 0) => toLocal(pickW(nx, ny, zo));
     const ring = (x, y, p, col, txt) => { ctx.beginPath(); ctx.arc(x, y, 22, -Math.PI / 2, -Math.PI / 2 + p * 2 * Math.PI); ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.stroke(); if (txt) { ctx.fillStyle = col; ctx.font = '12px monospace'; ctx.fillText(txt, x + 28, y + 4); } };
 
+    // Finger state uses each finger's own joints, independent of the thumb, so a curled
+    // thumb (as in a natural fist) can never block fist detection or fake a pinch.
     function classify(lm, size, r) {
-      const e = [[8, 6], [12, 10], [16, 14], [20, 18]].map(([t, p]) => D(lm[t], lm[0]) > D(lm[p], lm[0]) * 1.03), n = e.filter(Boolean).length;
-      if (r < .32 && D(lm[8], lm[0]) > D(lm[5], lm[0])) return 'pinch';
-      if (n === 0) return lm[4].y < lm[0].y - size * .55 && lm[4].y < lm[3].y ? 'thumb' : r > .4 ? 'fist' : 'none';
-      if (e[0] && !e[1] && !e[2] && !e[3]) return 'point';
-      if (e[0] && e[1] && !e[2] && !e[3]) return 'peace';
-      return n === 4 ? 'open' : 'none';
+      const F = [[8, 6, 5], [12, 10, 9], [16, 14, 13], [20, 18, 17]];
+      const ext = F.map(([t, p]) => D(lm[t], lm[0]) > D(lm[p], lm[0]) * 1.15);   // finger clearly straight
+      const curl = F.map(([t, , m]) => D(lm[t], lm[0]) < D(lm[m], lm[0]) * 0.95); // finger folded past its own base knuckle
+      const nExt = ext.filter(Boolean).length, nCurl = curl.filter(Boolean).length;
+      if (r < .32 && ext[0]) return 'pinch';                    // thumb+index touching, index still reaching out
+      if (nCurl === 4) return 'fist';                           // all four fingers folded - thumb position doesn't matter
+      const thumbUp = lm[4].y < lm[2].y - size * .35 && Math.hypot(lm[4].x - lm[0].x, lm[4].y - lm[0].y) > size * .9;
+      if (nCurl >= 3 && thumbUp) return 'thumb';
+      if (nExt === 4) return 'open';
+      if (ext[0] && !ext[1] && !ext[2] && !ext[3]) return 'point';
+      if (ext[0] && ext[1] && !ext[2] && !ext[3]) return 'peace';
+      return 'none';
     }
     function commit(h) {
       let p = h.pts; h.pts = [];
       if (p.length >= 16) p = p.slice(3, -4);                       // drop pinch-in / release drift
       if (p.length < 10) return setStatus('Stroke too short. Draw slower and bigger.');
-      const s = recognize(p); if (!s) return setStatus('Stroke too small.');
+      const s = recognize(p, ar); if (!s) return setStatus('Stroke too small.');
       if (!snapRef.current) s.type = 'free';
       const opt = { color: h.col }, X = s.cx, Y = s.cy;
       const wd = Math.max(.3, pickW(X - s.w / 2, Y).distanceTo(pickW(X + s.w / 2, Y))), ht = Math.max(.3, pickW(X, Y - s.h / 2).distanceTo(pickW(X, Y + s.h / 2)));
@@ -161,8 +169,9 @@ export default function Workspace({ user, onLogout }) {
         const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize()));
         add('cyl', a.clone().add(b).multiplyScalar(.5).toArray(), [.18, dir.length(), .18], [e.x, e.y, e.z], opt);
       } else {                                                       // free-form 3D curve; hand closer to camera = nearer in 3D
-        const st = Math.max(1, Math.floor(p.length / 28)), q = p.filter((_, i) => i % st === 0 || i === p.length - 1);
-        const pl = q.map(t => L(t.x, t.y, Math.max(-5, Math.min(5, (t.s / h.s0 - 1) * 8))));
+        const raws = p.map(t => t.s), sm = raws.map((_, i) => { const a = Math.max(0, i - 2), b = Math.min(raws.length, i + 3); return raws.slice(a, b).reduce((x, y) => x + y, 0) / (b - a); });
+        const st = Math.max(1, Math.floor(p.length / 28)), idx = [...Array(p.length).keys()].filter(i => i % st === 0 || i === p.length - 1);
+        const pl = idx.map(i => L(p[i].x, p[i].y, Math.max(-5, Math.min(5, (sm[i] / h.s0 - 1) * 9))));
         const ctr = pl.reduce((a, b) => a.add(b), new THREE.Vector3()).multiplyScalar(1 / pl.length);
         add('tube', ctr.toArray(), [1, 1, 1], [0, 0, 0], { ...opt, path: pl.map(x => x.sub(ctr).toArray().map(n => +n.toFixed(3))), closed: s.closed });
       }
@@ -213,17 +222,17 @@ export default function Workspace({ user, onLogout }) {
           if (!best) { best = newH(); best.col = COLS.find(cc => !Object.values(H).some(o => o.col === cc)) || COLS[0]; H[++nid] = best; }
           used.add(best); best.lm = lm; best.lost = 0; best.wx = lm[0].x; best.wy = lm[0].y; hs.push(best);
         });
-        Object.keys(H).forEach(k => { const h = H[k]; if (!used.has(h)) { h.lm = null; if (++h.lost > 12) { finish(h); delete H[k]; } else drawStroke(h); } });
+        Object.keys(H).forEach(k => { const h = H[k]; if (!used.has(h)) { h.lm = null; if (++h.lost > 24) { finish(h); delete H[k]; } else drawStroke(h); } });
         if (!hs.length) { two = zoom = null; setM(''); return; }
         hs.forEach(h => {
-          const lm = h.lm; h.size = D(lm[0], lm[9]) || .1; h.r = D(lm[4], lm[8]) / h.size; h.g = classify(lm, h.size, h.r);
+          const lm = h.lm; h.size = D(lm[0], lm[9]) || .1; const rawR = D(lm[4], lm[8]) / h.size; h.r = h.rf === undefined ? rawR : h.rf * .5 + rawR * .5; h.rf = h.r; h.g = classify(lm, h.size, h.r);
           h.sx = h.fx.f((lm[4].x + lm[8].x) / 2, dt); h.sy = h.fy.f((lm[4].y + lm[8].y) / 2, dt);
           lm.forEach((p, i) => { ctx.beginPath(); ctx.arc((1 - p.x) * c.width, p.y * c.height, i === 4 || i === 8 ? 5 : 2.5, 0, 7); ctx.fillStyle = i === 4 || i === 8 ? h.col : h.col + '77'; ctx.fill(); });
         });
         const fists = hs.filter(h => h.g === 'fist'), zooming = fists.length === 2, gr = hs.filter(h => h.grab), twoActive = gr.length === 2 && gr[0].grab.id === gr[1].grab.id, labs = [];
         hs.forEach(h => {
           const lm = h.lm, g = h.g, nx = 1 - h.sx, ny = h.sy, X = nx * c.width, Y = ny * c.height; let t = '';
-          if (h.pen || h.grab) { if (h.r > .55) { if (++h.relN >= 4) finish(h); } else h.relN = 0; }   // must stay open 4 frames to end
+          if (h.pen || h.grab) { if (h.r > .5) { if (++h.relN >= 5) finish(h); } else h.relN = 0; }   // must stay open 4 frames to end
           else if (g === 'pinch') { if (++h.pinchN >= 2) start(h, nx, ny); } else h.pinchN = 0;
           if (h.pen) { const l = h.pts[h.pts.length - 1]; if (!l || Math.hypot(nx - l.x, ny - l.y) > .002) h.pts.push({ x: nx, y: ny, s: h.size }); drawStroke(h); t = 'Drawing'; }
           else if (h.grab) { h.pl = L(nx, ny); if (!twoActive) h.grab.m.position.copy(h.pl).add(h.grab.off); t = twoActive ? 'Scale + twist' : 'Grab'; }
